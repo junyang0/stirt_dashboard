@@ -730,40 +730,47 @@ policy_rate_map = {
 
 # ---------- Dashboard Main ----------
 # Display current policy rate for selected underlying
-country = underlying_map.get(underlying_rate)
-if country and country in df_rates.index:
-    policy_info = df_rates.loc[country]
-    if "Country" == "Eurozone":
-        country = "EU"
-    elif "Country" == "USA":
-        country = "US"
-    st.subheader(f"Current Policy Rate: {policy_rate_map.get(underlying_rate, underlying_rate)}")
-    
-    # Create three columns for Rate, Last Change, Last Change Date
-    col1, col2, col3 = st.columns(3)
-    
-    col1.metric(label="Country", value=country)
-    col2.metric(label="Rate (%)", value=policy_info['Rate'])
-    col3.metric(label="Last Change", value=policy_info['Change'], delta=None)
-    
-    # Optionally show the date below as a caption
-    st.caption(f"Last Change Date: {policy_info['Date'][:-4] + " " + policy_info['Date'][-4:]}")
-    
-    # Optional: colored highlight based on rate direction
-    rate_change = policy_info['Change'].replace('+','').replace('-','')
-    try:
-        rate_change_val = float(rate_change)
-        if '+' in policy_info['Change']:
-            st.success(f"Rate increased by {policy_info['Change']} on {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
-        elif '-' in policy_info['Change']:
-            st.error(f"Rate decreased by {policy_info['Change']} on {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
-        else:
-            st.info("No change in rate")
-    except:
-        st.info("No change in rate")
+with st.container():
+    st.markdown("""
+    <style>
+    div[data-testid="stMetric"] {
+        background-color: blue;
+        padding: 10px;
+        border-radius: 5px;
+        box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        font-family: 'Arial', sans-serif;
+        margin-bottom: 20px;
+    }
+    div[data-testid="stMetric"] label[data-testid="stMetricLabel"] {
+        color: white !important;
+        font-weight: bold;
+    }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+        color: white !important;
+    }
+    div[data-testid="stMetric"] div[data-testid="stMetricDelta"] {
+        color: white !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-else:
-    st.warning("Policy rate data not available for this underlying.")# choose contract to plot
+    country = underlying_map.get(underlying_rate)
+    if country and country in df_rates.index:
+        policy_info = df_rates.loc[country]
+        if country == "Eurozone":
+            country = "EU"
+        elif country == "USA":
+            country = "US"
+        st.subheader(f"Current Policy Rate: {policy_rate_map.get(underlying_rate, underlying_rate)}")
+
+        col1, col2, col3 = st.columns(3, gap="small")
+        col1.metric(label="Country", value=country)
+        col2.metric(label="Rate (%)", value=policy_info['Rate'])
+        col3.metric(label="Last Change", value=policy_info['Change'], delta=None)
+
+        st.caption(f"Last Change Date: {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
+
 price_or_rate = st.selectbox("Plot Price or Yield", ["Price", "Yield"], index=1) 
 series_choice = "implied_rate" if price_or_rate == "Yield" else "lastPrice"
 to_plot = []
@@ -775,8 +782,14 @@ for i in contract_df['contract_name'].unique():
 to_plot_df = pd.concat(to_plot, axis=1)
 plot_df(to_plot_df)
 
+
+mat_tenor = st.selectbox("1M/3M", db[db['underlying'] == underlying_rate]['tenor'].unique())
+st.subheader("Latest contract values as of " + datetime.now().strftime("%Y-%m-%d"))
+n_contracts_adj = n_contracts if mat_tenor != '3M' else 12
+get_latest(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
+
+
 st.subheader("Difference matrix")
-mat_tenor = st.selectbox("Matrix tenor", db[db['underlying'] == underlying_rate]['tenor'].unique())
 if mat_tenor == '3M':
     start_month += (3 - start_month % 3) if start_month % 3 != 1 else 0
     n_contracts_adj = 12
@@ -795,9 +808,6 @@ def color_pos_neg(val):
     return f'color: {color}'
 styled_df = diff_df.replace(0, np.nan).style.applymap(color_pos_neg).format("{:.2f}")
 st.dataframe(styled_df, use_container_width=True)
-st.subheader("Latest contract values as of " + datetime.now().strftime("%Y-%m-%d"))
-
-get_latest(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
 
 
 cb_map = {
