@@ -309,6 +309,62 @@ def get_rba_board_meeting_dates(url="https://www.rba.gov.au/schedules-events/boa
     df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
     return pd.Series(df['Date'], name="RBA_Date")
 
+def get_boj_meeting_dates(url="https://www.mnimarkets.com/calendars/bank-of-japan-meeting-calendar"):
+    """
+    Scrape MNI Markets BOJ meeting calendar and return a DataFrame with year, start_date, end_date.
+    Handles ranges like 'Apr 29, 11:00 pm - 30' and simple ranges 'Jan 23 - 24'.
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    meetings_list = []
+
+    for list_div in soup.select("div.list"):
+        year_header = list_div.find("h2").text.strip()
+        year = int(year_header.split()[-1])
+        
+        for li in list_div.select("ul li"):
+            text = li.get_text(strip=True)
+            if "Meeting:" not in text:
+                continue
+            date_str = text.replace("Meeting:", "").strip()
+
+            # Handle 'Apr 29, 11:00 pm - 30' format
+            if '-' in date_str:
+                parts = date_str.split('-')
+                start_part = parts[0].strip()
+                end_part = parts[1].strip()
+                
+                # extract month from start if end only has day
+                try:
+                    start_date = datetime.strptime(f"{start_part} {year}", "%b %d %Y")
+                except ValueError:
+                    try:
+                        start_date = datetime.strptime(f"{start_part.split(',')[0]} {year}", "%b %d %Y")
+                    except:
+                        continue
+                
+                # If end part is only a day number
+                try:
+                    if any(c.isalpha() for c in end_part):
+                        end_date = datetime.strptime(f"{end_part} {year}", "%b %d %Y")
+                    else:
+                        end_date = start_date.replace(day=int(end_part))
+                except:
+                    end_date = start_date
+            else:
+                start_date = end_date = datetime.strptime(f"{date_str} {year}", "%b %d %Y")
+
+            meetings_list.append({
+                "Year": year,
+                "Start_Date": start_date.strftime("%Y-%m-%d"),
+                "End_Date": end_date.strftime("%Y-%m-%d")
+            })
+
+    return pd.Series([m['Start_Date'] for m in meetings_list], name="BOJ_Date")
+
 def get_barchart_ticker_name(interest_rate, tenor, month, year):
     """
     Returns a ticker name for a bar chart based on the interest rate, month, and year.
@@ -376,25 +432,58 @@ def get_barchart_ticker_name(interest_rate, tenor, month, year):
 def get_implied_rate(price):
     return 100 - price
 
-def get_data(ticker, url):
-    with requests.Session() as req:
-        req.headers.update(DEFAULT_HEADERS)
-        r = req.get(url[:25])
-        req.headers.update(
-            {'X-XSRF-TOKEN': unquote(r.cookies.get_dict()['XSRF-TOKEN'])})
-        params = {
-            'symbol': ticker,
-            'fields': 'tradeTime.format(m/d/Y),openPrice,highPrice,lowPrice,lastPrice,priceChange,percentChange,volume,openInterest,symbolCode,symbolType',
-            'type': 'eod',
-            'orderBy': 'tradeTime',
-            'orderDir': 'desc',
-            'limit': '65',
-            'meta': 'field.shortName,field.type,field.description',
-            'raw': '1'
-        }
-        r = req.get(url, params=params).json()
-        df= pd.DataFrame(r['data']).iloc[:, :-1]
-        return df
+import time
+import requests
+import pandas as pd
+from urllib.parse import unquote
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
+
+def get_data(ticker, url, max_retries=3, sleep_sec=1):
+    """
+    Fetch data from the Barchart API with full retry on failure.
+    Retries on network errors, JSON errors, or missing XSRF token.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            with requests.Session() as req:
+                req.headers.update(DEFAULT_HEADERS)
+
+                # First request to get XSRF token
+                r = req.get(url[:25])
+                xsrf_token = r.cookies.get('XSRF-TOKEN')
+                if not xsrf_token:
+                    raise ValueError("No XSRF-TOKEN found on initial request")
+
+                req.headers.update({'X-XSRF-TOKEN': unquote(xsrf_token)})
+
+                # Actual data request
+                params = {
+                    'symbol': ticker,
+                    'fields': 'tradeTime.format(m/d/Y),openPrice,highPrice,lowPrice,lastPrice,priceChange,percentChange,volume,openInterest,symbolCode,symbolType',
+                    'type': 'eod',
+                    'orderBy': 'tradeTime',
+                    'orderDir': 'desc',
+                    'limit': '65',
+                    'meta': 'field.shortName,field.type,field.description',
+                    'raw': '1'
+                }
+
+                r = req.get(url, params=params)
+                r.raise_for_status()  # raise if HTTP error
+                data = r.json()       # may raise JSONDecodeError
+                df = pd.DataFrame(data['data']).iloc[:, :-1]
+                return df
+
+        except (requests.RequestException, ValueError, KeyError, requests.exceptions.JSONDecodeError) as e:
+            print(f"[Attempt {attempt}] Failed to fetch {ticker}: {e}")
+            if attempt < max_retries:
+                time.sleep(5)
+            else:
+                print(f"All {max_retries} attempts failed for {ticker}.")
+                return pd.DataFrame() 
 
 def fetch_single(ticker, u, tenor, month, year):
     try:
@@ -448,32 +537,25 @@ def get_central_bank_rates():
 
     return df
 
-@functools.lru_cache(maxsize=32)
 def get_database(details, start_month, year, n_contracts, max_workers=5):
     tasks = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for u, tenor in details:
-            # decide step size based on tenor
-            if tenor == "3M":
-                step = 3
-                if start_month%3 != 1:
-                    start_month += (3 - start_month%3)
-            else:  # default to 1M
-                step = 1
+            step = 3 if tenor == "3M" else 1
+            n_contracts_adj = 12 if tenor == "3M" else n_contracts
+            adj_start_month = start_month  # use a copy
+            if tenor == "3M" and adj_start_month % 3 != 1:
+                adj_start_month += (3 - adj_start_month % 3)
 
-            for i in range(0, n_contracts, step):
-                # absolute month index
-                abs_month = start_month + i
-
-                # compute year offset and calendar month
+            for i in range(0, n_contracts_adj, step):
+                abs_month = adj_start_month + i
                 year_offset, month = divmod(abs_month - 1, 12)
                 month += 1
                 current_year = year + year_offset
 
                 ticker = get_barchart_ticker_name(u, tenor, month, current_year)
-                tasks.append(executor.submit(fetch_single, ticker, u, tenor, month, current_year))   
-
+                tasks.append(executor.submit(fetch_single, ticker, u, tenor, month, current_year))
         res = [future.result() for future in as_completed(tasks)]
 
     res = pd.concat(res, axis=0)
@@ -585,11 +667,11 @@ st.title("STIRT Dashboard")
 underlyings = [
     ('FED_FUNDS','1M'),
     ('ESTR','1M'),
+    ('TONA','3M'), 
+    ('SONIA','1M'), 
+    ('SARON','3M'), 
     ('CORRA','1M'),
     ('SFE_BA','1M'),
-    ('SONIA','1M'),
-    ('SARON','3M'),
-    ('TONA','3M')
 ]
 df_rates = get_central_bank_rates()
 
@@ -611,7 +693,7 @@ def load_db_from_barchart(underlyings, start_month, start_year, n_contracts, max
 
 # Sidebar controls
 with st.sidebar:
-    n_contracts = 12
+    n_contracts = 6
     start_date= datetime.now()
     start_month = start_date.month
     start_year = start_date.year
@@ -633,7 +715,18 @@ with st.sidebar:
         - [BOC Upcoming Events](https://www.bankofcanada.ca/press/upcoming-events/)
         - [SNB Event Schedule](https://www.snb.ch/en/services-events/digital-services/event-schedule)
         - [RBA Board Meeting Schedules](https://www.rba.gov.au/schedules-events/board-meeting-schedules.html)
+        - [BOJ Meeting Calendar](https://www.mnimarkets.com/calendars/bank-of-japan-meeting-calendar)
         """)
+
+policy_rate_map = {
+    "FED_FUNDS": "Fed Funds",
+    "ESTR": "ECB Deposit Rate",
+    "SONIA": "Bank of England Base Rate",
+    "CORRA": "Bank of Canada Overnight Rate",
+    "SARON": "Swiss National Bank Policy Rate",
+    "SFE_BA": "Reserve Bank of Australia Cash Rate", 
+    "TONA": "Bank of Japan Policy Rate"
+}
 
 # ---------- Dashboard Main ----------
 # Display current policy rate for selected underlying
@@ -644,7 +737,7 @@ if country and country in df_rates.index:
         country = "EU"
     elif "Country" == "USA":
         country = "US"
-    st.subheader(f"Current Policy Rate: {underlying_rate}")
+    st.subheader(f"Current Policy Rate: {policy_rate_map.get(underlying_rate, underlying_rate)}")
     
     # Create three columns for Rate, Last Change, Last Change Date
     col1, col2, col3 = st.columns(3)
@@ -654,16 +747,16 @@ if country and country in df_rates.index:
     col3.metric(label="Last Change", value=policy_info['Change'], delta=None)
     
     # Optionally show the date below as a caption
-    st.caption(f"Last Change Date: {policy_info['Date']}")
+    st.caption(f"Last Change Date: {policy_info['Date'][:-4] + " " + policy_info['Date'][-4:]}")
     
     # Optional: colored highlight based on rate direction
     rate_change = policy_info['Change'].replace('+','').replace('-','')
     try:
         rate_change_val = float(rate_change)
         if '+' in policy_info['Change']:
-            st.success(f"Rate increased by {policy_info['Change']}")
+            st.success(f"Rate increased by {policy_info['Change']} on {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
         elif '-' in policy_info['Change']:
-            st.error(f"Rate decreased by {policy_info['Change']}")
+            st.error(f"Rate decreased by {policy_info['Change']} on {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
         else:
             st.info("No change in rate")
     except:
@@ -684,7 +777,12 @@ plot_df(to_plot_df)
 
 st.subheader("Difference matrix")
 mat_tenor = st.selectbox("Matrix tenor", db[db['underlying'] == underlying_rate]['tenor'].unique())
-diff_df = get_matrix(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts, price_or_rate=price_or_rate)
+if mat_tenor == '3M':
+    start_month += (3 - start_month % 3) if start_month % 3 != 1 else 0
+    n_contracts_adj = 12
+else:
+    n_contracts_adj = n_contracts
+diff_df = get_matrix(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
 # Function to color values
 def color_pos_neg(val):
     if val == None:
@@ -695,11 +793,11 @@ def color_pos_neg(val):
     elif val < 0: 
         color = 'red'
     return f'color: {color}'
-
 styled_df = diff_df.replace(0, np.nan).style.applymap(color_pos_neg).format("{:.2f}")
 st.dataframe(styled_df, use_container_width=True)
 st.subheader("Latest contract values as of " + datetime.now().strftime("%Y-%m-%d"))
-get_latest(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts, price_or_rate=price_or_rate)
+
+get_latest(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
 
 
 cb_map = {
@@ -708,7 +806,8 @@ cb_map = {
     "SONIA": "BOE",
     "CORRA": "BOC",
     "SARON": "SNB",
-    "SFE_BA": "RBA"
+    "SFE_BA": "RBA", 
+    "TONA": "BOJ"
 }
 
 
@@ -720,15 +819,16 @@ def get_all_meeting_dates():
         "BOE": get_upcoming_mpc_dates().tolist(),
         "BOC": get_upcoming_boc_dates().tolist(),
         "SNB": get_upcoming_snb_dates().tolist(),
-        "RBA": get_rba_board_meeting_dates().tolist()
+        "RBA": get_rba_board_meeting_dates().tolist(), 
+        "BOJ": get_boj_meeting_dates().tolist()
     }
 if "meeting_dates" not in st.session_state:
     st.session_state.meeting_dates = get_all_meeting_dates()
 
 meeting_dates = st.session_state.meeting_dates
 spot_df = pd.DataFrame({
-    "underlying": ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA"],
-    "spot_rate": [float(df_rates.loc[underlying_map[u], 'Rate'].split("-")[-1]) if underlying_map[u] in df_rates.index else np.nan for u in ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA"]]
+    "underlying": ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA", "TONA"],
+    "spot_rate": [float(df_rates.loc[underlying_map[u], 'Rate'].split("-")[-1]) if underlying_map[u] in df_rates.index else np.nan for u in ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA", "TONA"]]
 })
 
 def implied_cut_probability_refined(current_rate, futures_rate, cut_size=0.25, days_after_meeting=10, total_days=30):
