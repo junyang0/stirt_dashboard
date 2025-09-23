@@ -1,10 +1,9 @@
 import re
-import time 
+import time
 import requests
-import functools
 import numpy as np
 import pandas as pd
-import altair as alt 
+import altair as alt
 import streamlit as st
 from io import StringIO
 from bs4 import BeautifulSoup
@@ -13,453 +12,331 @@ from urllib.parse import unquote
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Constants
 DEFAULT_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.188 Safari/537.36"
 }
 BARCHART_URL = "https://www.barchart.com/proxies/core-api/v1/historical/get?"
 MAX_WORKERS = 6
 
+# Mapping dictionaries
+UNDERLYING_MAP = {
+    "FED_FUNDS": "USA",
+    "ESTR": "Eurozone",
+    "CORRA": "Canada",
+    "SFE_BA": "Australia",
+    "SONIA": "United Kingdom",
+    "SARON": "Switzerland",
+    "TONA": "Japan"
+}
+
+POLICY_RATE_MAP = {
+    "FED_FUNDS": "Fed Funds",
+    "ESTR": "ECB Deposit Rate",
+    "SONIA": "Bank of England Base Rate",
+    "CORRA": "Bank of Canada Overnight Rate",
+    "SARON": "Swiss National Bank Policy Rate",
+    "SFE_BA": "Reserve Bank of Australia Cash Rate",
+    "TONA": "Bank of Japan Policy Rate"
+}
+
+CB_MAP = {
+    "FED_FUNDS": "FED",
+    "ESTR": "ECB",
+    "SONIA": "BOE",
+    "CORRA": "BOC",
+    "SARON": "SNB",
+    "SFE_BA": "RBA",
+    "TONA": "BOJ"
+}
+
+# --- Data Fetching Functions ---
+
 def get_upcoming_fomc_dates(url="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"):
-    """
-    Scrape the Federal Reserve FOMC calendar page and return a Pandas Series
-    of upcoming FOMC meeting dates (YYYY-MM-DD).
-    """
-    response = requests.get(url)
-    response.raise_for_status()  # raise error if request fails
-    soup = BeautifulSoup(response.content, "html.parser")
+    """Scrape upcoming FOMC meeting dates from the Federal Reserve website."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        meetings = []
+        today = datetime.today()
 
-    meetings = []
-    today = datetime.today()
+        for panel in soup.select(".panel.panel-default"):
+            year_heading = panel.select_one(".panel-heading h4")
+            if not year_heading:
+                continue
+            year = year_heading.text.strip().split(":")[-1].strip().split("FOMC")[0].strip()
 
-    for panel in soup.select(".panel.panel-default"):
-        year_heading = panel.select_one(".panel-heading h4")
-        if year_heading:
-            year_text = year_heading.text.strip()
-            year = year_text.split(":")[-1].strip().split("FOMC")[0].strip()
-            
             for row in panel.select(".fomc-meeting"):
-                month_str = row.select_one(".fomc-meeting__month strong").text.strip()
-                if "/" in month_str:
-                    month_str = month_str.split("/")[0].strip()
-                day_str = row.select_one(".fomc-meeting__date").text.strip().split("*")[0]
-                if '-' in day_str:
-                    day_str = day_str.split('-')[1].strip()
-                
-                # Try parsing month in abbreviated and full form
+                month_str = row.select_one(".fomc-meeting__month strong").text.strip().split("/")[0].strip()
+                day_str = row.select_one(".fomc-meeting__date").text.strip().split("*")[0].split('-')[-1].strip()
+
                 for fmt in ("%b %d %Y", "%B %d %Y"):
                     try:
                         date = datetime.strptime(f"{month_str} {day_str} {year}", fmt)
+                        if date >= today:
+                            meetings.append(date.strftime("%Y-%m-%d"))
                         break
                     except ValueError:
                         continue
                 else:
                     print(f"Unrecognized date format: {month_str} {day_str} {year}")
-                    continue
-                print(f"Found meeting date: {date.strftime('%Y-%m-%d')}")
-                if date >= today:
-                    meetings.append(date)
-
-    # Convert to Pandas Series with YYYY-MM-DD format
-    return pd.Series([d.strftime("%Y-%m-%d") for d in meetings], name="FOMC_Date")
+        return pd.Series(meetings, name="FOMC_Date")
+    except Exception as e:
+        print(f"Error fetching FOMC dates: {e}")
+        return pd.Series([], name="FOMC_Date")
 
 def get_upcoming_ecb_monetary_dates(url="https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html"):
-    """
-    Scrape the ECB calendar page and return a Pandas Series
-    of upcoming monetary policy meeting dates (YYYY-MM-DD).
-    """
-    response = requests.get(url)
-    response.raise_for_status()  # raise error if request fails
-    soup = BeautifulSoup(response.content, "html.parser")
-
-    meetings = []
-    today = datetime.today()
-
-    # Iterate over all <dt>/<dd> pairs in the definition list
-    dts = soup.select("div.definition-list dl dt")
-    dds = soup.select("div.definition-list dl dd")
-
-    for dt, dd in zip(dts, dds):
-        date_str = dt.text.strip()  # e.g., "04/02/2026"
-        desc = dd.text.strip()
-
-        # Only include monetary policy meetings
-        if "monetary policy meeting" in desc.lower() and "day 2" in desc.lower():
-            try:
-                date = datetime.strptime(date_str, "%d/%m/%Y")
-            except ValueError:
-                print(f"Unrecognized date format: {date_str}")
-                continue
-
-            if date >= today:
-                meetings.append({
-                    "Date": date.strftime("%Y-%m-%d"),
-                })
-                print(f"Found ECB monetary policy meeting: {date.strftime('%Y-%m-%d')} - {desc}")
-
-    df = pd.DataFrame(meetings)
-    return pd.Series(df['Date'], name="ECB_Date")
-
-
-def get_upcoming_mpc_dates(url="https://www.bankofengland.co.uk/monetary-policy/upcoming-mpc-dates"):
-    """
-    Scrape the Bank of England MPC calendar page for all tables (multiple years) and return
-    a DataFrame of upcoming MPC meeting dates (YYYY-MM-DD) with descriptions and links.
-    """
-    headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/116.0.5845.188 Safari/537.36"
-    }
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
-
-    meetings = []
-    today = datetime.today()
-
-    # Iterate over all tables (assuming each table corresponds to a year)
-    for table in soup.select("table"):
-        # Optional: detect year from preceding heading
-        year_heading = table.find_previous(["h2", "h3", "h4"])
-        if year_heading and any(str(y) in year_heading.text for y in range(2025, 2030)):
-            year = int([y for y in range(2025, 2030) if str(y) in year_heading.text][0])
-        else:
-            year = today.year  # fallback
-
-        for row in table.select("tbody tr"):
-            tds = row.find_all("td")
-            if len(tds) != 2:
-                continue
-            date_str = tds[0].text.strip()  # e.g., "Thursday 6 February"
-            desc_span = tds[1].find("span")
-            desc = desc_span.text.strip() if desc_span else ""
-            
-            # Parse date with detected year
-            try:
-                date = datetime.strptime(f"{date_str} {year}", "%A %d %B %Y")
-            except ValueError:
-                print(f"Unrecognized date format: {date_str} with year {year}")
-                continue
-
-            if date >= today:
-                links = [a['href'] for a in tds[1].find_all("a")]
-                meetings.append({
-                    "Date": date.strftime("%Y-%m-%d"),
-                    "Description": desc,
-                   "Links": links
-                })
-                print(f"Found MPC meeting: {date.strftime('%Y-%m-%d')} - {desc}")
-
-    df = pd.DataFrame(meetings)
-    return pd.Series(df['Date'], name="MPC_Date")
-
-def get_upcoming_boc_dates(pages=3):
-    """
-    Scrape the Bank of Canada upcoming events pages for interest rate and monetary policy events.
-    Returns a DataFrame with Date, Description, and Link.
-    """
-    base_url = "https://www.bankofcanada.ca/press/upcoming-events/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/116.0.5845.188 Safari/537.36"
-    }
-
-    events = []
-    today = datetime.today()
-
-    for page in range(1, pages + 1):
-        url = base_url if page == 1 else f"{base_url}?mt_page={page}"
-        response = requests.get(url, headers=headers)
+    """Scrape upcoming ECB monetary policy meeting dates."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
+        meetings = []
+        today = datetime.today()
 
-        for media in soup.select(".media-body"):
-            date_span = media.select_one(".media-date")
-            h3 = media.select_one("h3.media-heading a")
-            if not date_span or not h3:
-                continue
-
-            date_str = date_span.text.strip()  # e.g., "October 29, 2025"
-            desc = h3.text.strip()
-            link = h3['href']
-
-            # Only include monetary policy / interest rate announcements
-            if "monetary policy" in desc.lower() or "interest rate" in desc.lower():
+        for dt, dd in zip(soup.select("div.definition-list dl dt"), soup.select("div.definition-list dl dd")):
+            date_str = dt.text.strip()
+            desc = dd.text.strip()
+            if "monetary policy meeting" in desc.lower() and "day 2" in desc.lower():
                 try:
-                    date = datetime.strptime(date_str, "%B %d, %Y")
+                    date = datetime.strptime(date_str, "%d/%m/%Y")
+                    if date >= today:
+                        meetings.append(date.strftime("%Y-%m-%d"))
                 except ValueError:
                     print(f"Unrecognized date format: {date_str}")
+        return pd.Series(meetings, name="ECB_Date")
+    except Exception as e:
+        print(f"Error fetching ECB dates: {e}")
+        return pd.Series([], name="ECB_Date")
+
+def get_upcoming_mpc_dates(url="https://www.bankofengland.co.uk/monetary-policy/upcoming-mpc-dates"):
+    """Scrape upcoming Bank of England MPC meeting dates."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        meetings = []
+        today = datetime.today()
+
+        for table in soup.select("table"):
+            year_heading = table.find_previous(["h2", "h3", "h4"])
+            year = int(re.search(r"\d{4}", year_heading.text).group()) if year_heading and re.search(r"\d{4}", year_heading.text) else today.year
+
+            for row in table.select("tbody tr"):
+                tds = row.find_all("td")
+                if len(tds) != 2:
                     continue
+                date_str = tds[0].text.strip()
+                try:
+                    date = datetime.strptime(f"{date_str} {year}", "%A %d %B %Y")
+                    if date >= today:
+                        meetings.append(date.strftime("%Y-%m-%d"))
+                except ValueError:
+                    print(f"Unrecognized date format: {date_str} with year {year}")
+        return pd.Series(meetings, name="MPC_Date")
+    except Exception as e:
+        print(f"Error fetching MPC dates: {e}")
+        return pd.Series([], name="MPC_Date")
 
-                if date >= today:
-                    events.append({
-                        "Date": date.strftime("%Y-%m-%d")
-                    })
-                    print(f"Found BOC event: {date.strftime('%Y-%m-%d')} - {desc}")
+def get_upcoming_boc_dates(pages=3, url="https://www.bankofcanada.ca/press/upcoming-events/"):
+    """Scrape upcoming Bank of Canada interest rate and monetary policy events."""
+    try:
+        events = []
+        today = datetime.today()
 
-    df = pd.DataFrame(events)
-    return pd.Series(df['Date'], name="BOC_Date")
+        for page in range(1, pages + 1):
+            page_url = url if page == 1 else f"{url}?mt_page={page}"
+            response = requests.get(page_url, headers=DEFAULT_HEADERS)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            for media in soup.select(".media-body"):
+                date_span = media.select_one(".media-date")
+                h3 = media.select_one("h3.media-heading a")
+                if not date_span or not h3:
+                    continue
+                date_str = date_span.text.strip()
+                desc = h3.text.strip()
+                if "monetary policy" in desc.lower() or "interest rate" in desc.lower():
+                    try:
+                        date = datetime.strptime(date_str, "%B %d, %Y")
+                        if date >= today:
+                            events.append(date.strftime("%Y-%m-%d"))
+                    except ValueError:
+                        print(f"Unrecognized date format: {date_str}")
+        return pd.Series(events, name="BOC_Date")
+    except Exception as e:
+        print(f"Error fetching BOC dates: {e}")
+        return pd.Series([], name="BOC_Date")
 
 def get_upcoming_snb_dates(url="https://www.snb.ch/en/services-events/digital-services/event-schedule"):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/116.0.5845.188 Safari/537.36"
-    }
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
+    """Scrape upcoming Swiss National Bank monetary policy events."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        events = []
+        today = datetime.today()
 
-    events = []
-    today = datetime.today()
-
-    for li in soup.select("li.col-12.link-list-item"):
-        a_tag = li.find("a", class_="link-list-item__link")
-        if not a_tag:
-            continue
-        title_tag = li.select_one(".publication-title h3")
-        date_tag = li.select_one(".publication-date")
-        time_tag = li.select_one(".publication-type")
-
-        if not title_tag or not date_tag:
-            continue
-
-        title = title_tag.text.strip()
-        # Filter only monetary policy assessments
-        if "monetary policy" not in title.lower():
-            continue
-
-        date_str = date_tag.text.strip()  # e.g., "25.09.2025"
-        time_str = time_tag.text.strip() if time_tag else ""
-
-        try:
-            date = datetime.strptime(date_str, "%d.%m.%Y")
-        except ValueError:
-            print(f"Unrecognized date format: {date_str}")
-            continue
-
-        if date >= today:
-            events.append({
-                "Date": date.strftime("%Y-%m-%d")
-            })
-            print(f"Found SNB event: {date.strftime('%Y-%m-%d')} - {title}")
-
-    return pd.Series([e['Date'] for e in events], name="SNB_Date")
+        for li in soup.select("li.col-12.link-list-item"):
+            title_tag = li.select_one(".publication-title h3")
+            date_tag = li.select_one(".publication-date")
+            if not title_tag or not date_tag or "monetary policy" not in title_tag.text.lower():
+                continue
+            date_str = date_tag.text.strip()
+            try:
+                date = datetime.strptime(date_str, "%d.%m.%Y")
+                if date >= today:
+                    events.append(date.strftime("%Y-%m-%d"))
+            except ValueError:
+                print(f"Unrecognized date format: {date_str}")
+        return pd.Series(events, name="SNB_Date")
+    except Exception as e:
+        print(f"Error fetching SNB dates: {e}")
+        return pd.Series([], name="SNB_Date")
 
 def get_rba_board_meeting_dates(url="https://www.rba.gov.au/schedules-events/board-meeting-schedules.html"):
-    response = requests.get(url)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
+    """Scrape upcoming Reserve Bank of Australia board meeting dates."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        tables = soup.find_all("table", class_="table-linear")
+        current_year = datetime.today().year
+        meetings = []
+        month_map = {m: i for i, m in enumerate(["January", "February", "March", "April", "May", "June",
+                                                 "July", "August", "September", "October", "November", "December"], 1)}
 
-    tables = soup.find_all("table", class_="table-linear")
-    current_year = datetime.today().year
-    next_year = current_year + 1
-
-    meetings = []
-
-    month_map = {m: i for i, m in enumerate([
-        "January","February","March","April","May","June",
-        "July","August","September","October","November","December"], 1)}
-
-    for table in tables:
-        caption = table.find("caption")
-        if not caption:
-            continue
-        year_match = re.search(r"(\d{4})", caption.text)
-        if not year_match:
-            continue
-        year = int(year_match.group(1))
-        if year not in [current_year, next_year]:
-            continue
-
-        for row in table.tbody.find_all("tr"):
-            cols = row.find_all(["th", "td"])
-            if len(cols) < 2:
+        for table in tables:
+            caption = table.find("caption")
+            if not caption:
                 continue
-            month_name = cols[0].text.strip()
-            month_num = month_map.get(month_name, None)
-            if not month_num:
+            year_match = re.search(r"(\d{4})", caption.text)
+            if not year_match or int(year_match.group(1)) not in [current_year, current_year + 1]:
                 continue
-            dates_text = cols[1].text.strip()
-            if not dates_text:
-                continue
+            year = int(year_match.group(1))
 
-            # Remove footnotes
-            dates_text = re.sub(r'\s*\(.*?\)', '', dates_text)
-            # Handle date ranges
-            match_range = re.findall(r'(\d+)[–-](\d+)\s*(\w+)?', dates_text)
-            if match_range:
-                for start, end, month_override in match_range:
-                    month_final = month_map.get(month_override, month_num) if month_override else month_num
-                    date = datetime.strptime(f"{end} {month_final} {year}", "%d %m %Y")
-                    if date >= datetime.today():
-                        meetings.append(date)
-            else:
-                day_match = re.search(r'(\d+)\s*(\w+)?', dates_text)
-                if day_match:
-                    day = day_match.group(1)
-                    month_override = day_match.group(2)
-                    month_final = month_map.get(month_override, month_num) if month_override else month_num
-                    date = datetime.strptime(f"{day} {month_final} {year}", "%d %m %Y")
-                    if date >= datetime.today():
-                        meetings.append(date)
-
-    df = pd.DataFrame(sorted(meetings), columns=["Date"])
-    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-    return pd.Series(df['Date'], name="RBA_Date")
+            for row in table.tbody.find_all("tr"):
+                cols = row.find_all(["th", "td"])
+                if len(cols) < 2:
+                    continue
+                month_name = cols[0].text.strip()
+                month_num = month_map.get(month_name)
+                if not month_num:
+                    continue
+                dates_text = re.sub(r'\s*\(.*?\)', '', cols[1].text.strip())
+                match_range = re.findall(r'(\d+)[–-](\d+)\s*(\w+)?', dates_text)
+                if match_range:
+                    for start, end, month_override in match_range:
+                        month_final = month_map.get(month_override, month_num) if month_override else month_num
+                        date = datetime.strptime(f"{end} {month_final} {year}", "%d %m %Y")
+                        if date >= datetime.today():
+                            meetings.append(date)
+                else:
+                    day_match = re.search(r'(\d+)\s*(\w+)?', dates_text)
+                    if day_match:
+                        day = day_match.group(1)
+                        month_final = month_map.get(day_match.group(2), month_num) if day_match.group(2) else month_num
+                        date = datetime.strptime(f"{day} {month_final} {year}", "%d %m %Y")
+                        if date >= datetime.today():
+                            meetings.append(date)
+        df = pd.DataFrame(sorted(meetings), columns=["Date"]).dt.strftime("%Y-%m-%d")
+        return pd.Series(df["Date"], name="RBA_Date")
+    except Exception as e:
+        print(f"Error fetching RBA dates: {e}")
+        return pd.Series([], name="RBA_Date")
 
 def get_boj_meeting_dates(url="https://www.mnimarkets.com/calendars/bank-of-japan-meeting-calendar"):
-    """
-    Scrape MNI Markets BOJ meeting calendar and return a DataFrame with year, start_date, end_date.
-    Handles ranges like 'Apr 29, 11:00 pm - 30' and simple ranges 'Jan 23 - 24'.
-    """
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    """Scrape upcoming Bank of Japan meeting dates."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        meetings = []
 
-    meetings_list = []
-
-    for list_div in soup.select("div.list"):
-        year_header = list_div.find("h2").text.strip()
-        year = int(year_header.split()[-1])
-        
-        for li in list_div.select("ul li"):
-            text = li.get_text(strip=True)
-            if "Meeting:" not in text:
-                continue
-            date_str = text.replace("Meeting:", "").strip()
-
-            # Handle 'Apr 29, 11:00 pm - 30' format
-            if '-' in date_str:
-                parts = date_str.split('-')
-                start_part = parts[0].strip()
-                end_part = parts[1].strip()
-                
-                # extract month from start if end only has day
-                try:
-                    start_date = datetime.strptime(f"{start_part} {year}", "%b %d %Y")
-                except ValueError:
+        for list_div in soup.select("div.list"):
+            year = int(list_div.find("h2").text.strip().split()[-1])
+            for li in list_div.select("ul li"):
+                text = li.get_text(strip=True)
+                if "Meeting:" not in text:
+                    continue
+                date_str = text.replace("Meeting:", "").strip()
+                if '-' in date_str:
+                    start_part, end_part = date_str.split('-')
+                    start_part, end_part = start_part.strip(), end_part.strip()
                     try:
                         start_date = datetime.strptime(f"{start_part.split(',')[0]} {year}", "%b %d %Y")
-                    except:
+                        end_date = datetime.strptime(f"{end_part} {year}", "%b %d %Y") if any(c.isalpha() for c in end_part) else start_date.replace(day=int(end_part))
+                    except ValueError:
                         continue
-                
-                # If end part is only a day number
-                try:
-                    if any(c.isalpha() for c in end_part):
-                        end_date = datetime.strptime(f"{end_part} {year}", "%b %d %Y")
-                    else:
-                        end_date = start_date.replace(day=int(end_part))
-                except:
-                    end_date = start_date
-            else:
-                start_date = end_date = datetime.strptime(f"{date_str} {year}", "%b %d %Y")
+                else:
+                    try:
+                        start_date = end_date = datetime.strptime(f"{date_str} {year}", "%b %d %Y")
+                    except ValueError:
+                        continue
+                if end_date >= datetime.today():
+                    meetings.append(start_date.strftime("%Y-%m-%d"))
+        return pd.Series(meetings, name="BOJ_Date")
+    except Exception as e:
+        print(f"Error fetching BOJ dates: {e}")
+        return pd.Series([], name="BOJ_Date")
 
-            meetings_list.append({
-                "Year": year,
-                "Start_Date": start_date.strftime("%Y-%m-%d"),
-                "End_Date": end_date.strftime("%Y-%m-%d")
-            })
+def get_central_bank_rates(url="https://www.cbrates.com/"):
+    """Fetch current central bank policy rates."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        data = []
 
-    return pd.Series([m['Start_Date'] for m in meetings_list], name="BOJ_Date")
+        for row in soup.find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) >= 6:
+                rate = cols[1].get_text(strip=True).replace('%', '')
+                change = cols[2].get_text(strip=True)
+                country = cols[4].get_text(strip=True).split("|")[0].strip()
+                change_date = cols[5].get_text(strip=True)
+                data.append([country, rate, change, change_date])
+        df = pd.DataFrame(data, columns=["Country", "Rate", "Change", "Date"]).set_index("Country")
+        return df
+    except Exception as e:
+        print(f"Error fetching central bank rates: {e}")
+        return pd.DataFrame(columns=["Rate", "Change", "Date"]).set_index("Country")
 
 def get_barchart_ticker_name(interest_rate, tenor, month, year):
-    """
-    Returns a ticker name for a bar chart based on the interest rate, month, and year.
-
-    Parameters:
-    interest_rate str: Name of underlying interest rate (e.g., 'LIBOR', 'SOFR').
-    month (int): Month as an integer (1-12).
-    year (int): Year as a four-digit integer (e.g., 2023).
-    tenor (str): Tenor of the interest rate (e.g., '1M', '3M').
-    Returns:
-    str: Formatted ticker name (e.g., ZQU25 for Fed Funds, December 2025).
-    """
-    month_codes = {
-        1: 'F',  # January
-        2: 'G',  # February
-        3: 'H',  # March
-        4: 'J',  # April
-        5: 'K',  # May
-        6: 'M',  # June
-        7: 'N',  # July
-        8: 'Q',  # August
-        9: 'U',  # September
-        10: 'V', # October
-        11: 'X', # November
-        12: 'Z'  # December
+    """Generate Barchart ticker name for a given interest rate, tenor, month, and year."""
+    month_codes = {1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M', 7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'}
+    ticker_prefix = {
+        "FED_FUNDS": {"1M": "ZQ"},
+        "ESTR": {"1M": "EG"},
+        "TONA": {"3M": "T0"},
+        "SONIA": {"1M": "JU"},
+        "CORRA": {"1M": "RI", "3M": "RG"},
+        "SARON": {"3M": "J2"},
+        "SFE_BA": {"1M": "IQ"}
     }
-    ticker_prefix = { 
-        "FED_FUNDS": {
-            "1M": "ZQ"
-        },
-        "ESTR": {
-            "1M": "EG"
-        }, 
-        "TONA": {
-            "3M": "T0"
-        }, 
-        "SONIA": { 
-            "1M": "JU", 
-            #"3M": "J8",
-        },
-        "CORRA": { 
-            "1M": "RI", 
-            "3M": "RG"
-        }, 
-        "SARON": { 
-            "3M": "J2"
-        }, 
-        "SFE_BA":{ 
-            "1M": "IQ",
-            #"3M": "IR"
-        }
-    }
-    if interest_rate not in ticker_prefix:
-        raise ValueError(f"Unsupported interest rate: {interest_rate}")
-    if tenor not in ticker_prefix[interest_rate]:
-        raise ValueError(f"Unsupported tenor: {tenor} for interest rate: {interest_rate}")
-    if month not in month_codes:
-        raise ValueError("Month must be an integer between 1 and 12.")
-    if year < 2000 or year > 2099:
-        raise ValueError("Year must be a four-digit integer between 2000 and 2099.")
-    month_code = month_codes[month]
-    year_code = str(year)[-2:]
-    return f"{ticker_prefix[interest_rate][tenor]}{month_code}{year_code}"
+    if interest_rate not in ticker_prefix or tenor not in ticker_prefix[interest_rate]:
+        raise ValueError(f"Unsupported interest rate or tenor: {interest_rate}, {tenor}")
+    if month not in month_codes or not (2000 <= year <= 2099):
+        raise ValueError("Invalid month or year")
+    return f"{ticker_prefix[interest_rate][tenor]}{month_codes[month]}{str(year)[-2:]}"
 
 def get_implied_rate(price):
+    """Calculate implied rate from futures price."""
     return 100 - price
 
-import time
-import requests
-import pandas as pd
-from urllib.parse import unquote
-
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
-
-def get_data(ticker, url, max_retries=3, sleep_sec=1):
-    """
-    Fetch data from the Barchart API with full retry on failure.
-    Retries on network errors, JSON errors, or missing XSRF token.
-    """
+def get_data(ticker, url=BARCHART_URL, max_retries=3, sleep_sec=5):
+    """Fetch historical data for a given ticker from Barchart API."""
     for attempt in range(1, max_retries + 1):
         try:
             with requests.Session() as req:
                 req.headers.update(DEFAULT_HEADERS)
-
-                # First request to get XSRF token
                 r = req.get(url[:25])
                 xsrf_token = r.cookies.get('XSRF-TOKEN')
                 if not xsrf_token:
-                    raise ValueError("No XSRF-TOKEN found on initial request")
-
+                    raise ValueError("No XSRF-TOKEN found")
                 req.headers.update({'X-XSRF-TOKEN': unquote(xsrf_token)})
-
-                # Actual data request
                 params = {
                     'symbol': ticker,
                     'fields': 'tradeTime.format(m/d/Y),openPrice,highPrice,lowPrice,lastPrice,priceChange,percentChange,volume,openInterest,symbolCode,symbolType',
@@ -470,28 +347,29 @@ def get_data(ticker, url, max_retries=3, sleep_sec=1):
                     'meta': 'field.shortName,field.type,field.description',
                     'raw': '1'
                 }
-
                 r = req.get(url, params=params)
-                r.raise_for_status()  # raise if HTTP error
-                data = r.json()       # may raise JSONDecodeError
+                r.raise_for_status()
+                data = r.json()
                 df = pd.DataFrame(data['data']).iloc[:, :-1]
+                df.index = pd.to_datetime(df['tradeTime'])
                 return df
-
         except (requests.RequestException, ValueError, KeyError, requests.exceptions.JSONDecodeError) as e:
             print(f"[Attempt {attempt}] Failed to fetch {ticker}: {e}")
             if attempt < max_retries:
-                time.sleep(5)
+                time.sleep(sleep_sec)
             else:
-                print(f"All {max_retries} attempts failed for {ticker}.")
-                return pd.DataFrame() 
+                print(f"All {max_retries} attempts failed for {ticker}")
+                return pd.DataFrame()
 
-def fetch_single(ticker, u, tenor, month, year):
+def fetch_single(ticker, underlying, tenor, month, year):
+    """Fetch and format data for a single ticker."""
     try:
         print(f"Fetching data for {ticker}")
-        df = get_data(ticker, BARCHART_URL)
-        df.index = pd.to_datetime(df['tradeTime'])
+        df = get_data(ticker)
+        if df.empty:
+            return df
         df = df[['lastPrice']].copy()
-        df['underlying'] = u
+        df['underlying'] = underlying
         df['tenor'] = tenor
         df['contract_name'] = ticker
         df['monthYear'] = ticker[2:]
@@ -500,209 +378,185 @@ def fetch_single(ticker, u, tenor, month, year):
         df['period'] = datetime(year, month, 1)
         return df
     except Exception as e:
-        print(f"Error fetching data for {(ticker, u, tenor, month, year)}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error fetching data for {ticker}: {e}")
+        return pd.DataFrame()
 
-def convert_column_to_float(df, column_names):
-    for col in column_names:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
-
-def get_central_bank_rates():
-    url = "https://www.cbrates.com/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-    }
-
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.content, "html.parser")
-
-    rows = soup.find_all("tr")
-    data = []
-
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) >= 6:
-            rate = cols[1].get_text(strip=True).replace('%','')
-            change = cols[2].get_text(strip=True)
-            country = cols[4].get_text(strip=True).split("|")[0].strip() if len(cols) > 4 else ""
-            change_date = cols[5].get_text(strip=True) if len(cols) > 5 else ""
-            data.append([country, rate, change, change_date])
-
-    df = pd.DataFrame(data, columns=["Country", "Rate", "Change", "Date"])
-
-    # Set index to Country
-    df.set_index("Country", inplace=True)
-
-    return df
-
-def get_database(details, start_month, year, n_contracts, max_workers=5):
+def get_database(underlyings, start_month, year, n_contracts, max_workers=MAX_WORKERS):
+    """Fetch futures data for multiple underlyings and tenors."""
     tasks = []
-    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for u, tenor in details:
+        for underlying, tenor in underlyings:
             step = 3 if tenor == "3M" else 1
             n_contracts_adj = 12 if tenor == "3M" else n_contracts
-            adj_start_month = start_month  # use a copy
-            if tenor == "3M" and adj_start_month % 3 != 1:
-                adj_start_month += (3 - adj_start_month % 3)
-
+            adj_start_month = start_month + (3 - start_month % 3) if tenor == "3M" and start_month % 3 != 1 else start_month
             for i in range(0, n_contracts_adj, step):
                 abs_month = adj_start_month + i
                 year_offset, month = divmod(abs_month - 1, 12)
                 month += 1
                 current_year = year + year_offset
+                ticker = get_barchart_ticker_name(underlying, tenor, month, current_year)
+                tasks.append(executor.submit(fetch_single, ticker, underlying, tenor, month, current_year))
+        results = [future.result() for future in as_completed(tasks)]
+    if not results:
+        return pd.DataFrame()
+    df = pd.concat(results, axis=0)
+    df['lastPrice'] = pd.to_numeric(df['lastPrice'], errors='coerce')
+    df['implied_rate'] = df['lastPrice'].apply(get_implied_rate)
+    return df.sort_values(by=['year', 'month'], ascending=True)
 
-                ticker = get_barchart_ticker_name(u, tenor, month, current_year)
-                tasks.append(executor.submit(fetch_single, ticker, u, tenor, month, current_year))
-        res = [future.result() for future in as_completed(tasks)]
-
-    res = pd.concat(res, axis=0)
-    res = convert_column_to_float(res, ['lastPrice'])
-    res['implied_rate'] = res['lastPrice'].apply(get_implied_rate)
-    return res
-
-
-def get_latest_data(db : pd.DataFrame, month: int, year: int):
+def get_latest_data(db, month, year):
+    """Get the most recent data for a specific month and year."""
     return db[(db['month'] == month) & (db['year'] == year)].sort_index().iloc[-1]
 
-def get_matrix(db : pd.DataFrame , underlying, tenor, start_month_and_year : list|tuple, n_months : int, price_or_rate = 'rate'):
+def get_matrix(db, underlying, tenor, start_month_and_year, n_months, price_or_rate='rate'):
+    """Generate a difference matrix for implied rates or prices."""
     df = db[(db['underlying'] == underlying) & (db['tenor'] == tenor)].copy()
     matrix = pd.DataFrame()
     current_month, current_year = start_month_and_year
     for i in range(n_months):
         month = current_month + i
-        year = current_year
-        if month > 12:
-            month -= 12
-            year += 1
+        year = current_year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
         try:
             latest = get_latest_data(df, month, year)
             matrix = pd.concat([matrix, latest.to_frame().T], axis=0)
-        except:
-            print(f"Error for {underlying} {tenor} {month} {year}")
-        
+        except Exception as e:
+            print(f"Error for {underlying} {tenor} {month} {year}: {e}")
+    if matrix.empty:
+        return pd.DataFrame()
     matrix.index = matrix['contract_name']
-    if price_or_rate == 'rate':
-        values = matrix['implied_rate']
-    else:
-        values = matrix['lastPrice']
-        
-    # Create n×n difference matrix
-    diff_matrix = values.values.reshape(-1, 1) - values.values.reshape(1, -1)
-    # make it 2dp 
-    diff_df = pd.DataFrame(diff_matrix, index=matrix.index, columns=matrix.index)
-    # Clean up labels
-    diff_df.index.name = None
-    diff_df.columns.name = None
+    values = matrix['implied_rate'] if price_or_rate == 'rate' else matrix['lastPrice']
+    diff_matrix = pd.DataFrame(values.values.reshape(-1, 1) - values.values.reshape(1, -1), index=matrix.index, columns=matrix.index)
+    return diff_matrix
 
-    return diff_df
-
-def get_latest(db : pd.DataFrame , underlying, tenor, start_month_and_year : list|tuple, n_months : int, price_or_rate = 'rate'):
+def get_latest(db, underlying, tenor, start_month_and_year, n_months, price_or_rate='rate'):
+    """Generate a DataFrame of latest contract values."""
     df = db[(db['underlying'] == underlying) & (db['tenor'] == tenor)].copy()
     matrix = pd.DataFrame()
     current_month, current_year = start_month_and_year
     for i in range(n_months):
         month = current_month + i
-        year = current_year
-        if month > 12:
-            month -= 12
-            year += 1
+        year = current_year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
         try:
             latest = get_latest_data(df, month, year)
-            try: 
-                matrix = pd.concat([matrix, latest.to_frame().T], axis=0)
-            except: 
-                print(f"Error concatenating for {underlying} {tenor} {month} {year}")
-        except:
-            print(f"Error for {underlying} {tenor} {month} {year}")
-            
-            
-    matrix['expiry'] = matrix.apply(lambda row: f"{row['month']:02d}/{row['year']}", axis=1)
+            matrix = pd.concat([matrix, latest.to_frame().T], axis=0)
+        except Exception as e:
+            print(f"Error for {underlying} {tenor} {month} {year}: {e}")
+    if matrix.empty:
+        return pd.DataFrame()
+    matrix['expiry'] = matrix.apply(lambda row: f"{int(row['month']):02d}/{row['year']}", axis=1)
     matrix.index = pd.to_datetime(matrix.index).strftime('%Y-%m-%d')
-    matrix = matrix[['contract_name', 'expiry', 'lastPrice', 'implied_rate']]
-    st.dataframe(matrix, use_container_width=True, hide_index=True)
+    return matrix[['contract_name', 'expiry', 'lastPrice', 'implied_rate']]
 
-
-def plot_df(df: pd.DataFrame, title: str = "Time Series",
-            ylabel: str = "Value", xlabel: str = "Date"):
-    # Ensure index is datetime
+def plot_df(df, title="Time Series", ylabel="Value", xlabel="Date"):
+    """Plot time series data using Altair."""
     df.index = pd.to_datetime(df.index)
     df = df.reset_index(names=[xlabel])
-    
-    # Melt to long format for multiple lines
     df_long = df.melt(id_vars=[xlabel], var_name="Contract", value_name=ylabel)
-
-    # Legend selection (clickable)
     legend_selection = alt.selection_point(fields=["Contract"], bind="legend")
-    
     chart = (
         alt.Chart(df_long)
         .mark_line()
         .encode(
             x=alt.X(xlabel, title=xlabel),
             y=alt.Y(ylabel, title=ylabel, scale=alt.Scale(zero=False)),
-            color=alt.Color(
-                "Contract",
-                sort=list(df_long["Contract"].unique()),  # preserve original order
-                legend=alt.Legend(title="Contract")
-            ), 
+            color=alt.Color("Contract", sort=list(df_long["Contract"].unique()), legend=alt.Legend(title="Contract")),
             tooltip=[xlabel, "Contract", ylabel],
             opacity=alt.condition(legend_selection, alt.value(1), alt.value(0.1))
         )
         .properties(title=title, width=700, height=400)
         .add_params(legend_selection)
     )
-
     st.altair_chart(chart, use_container_width=True)
 
-# Exammple to get_matrix of spread get_matrix(db, 'FED_FUNDS', '1M', (datetime.now().month, datetime.now().year), 3, 'price')
-# app.py
+def fetch_fed_probabilities(url="https://www.investing.com/central-banks/fed-rate-monitor"):
+    """Fetch implied rate change probabilities for FOMC meetings."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data = []
+        for meeting in soup.find_all('div', class_='cardWrapper'):
+            date_div = meeting.find('div', class_='fedRateDate')
+            meeting_date = date_div.text.strip() if date_div else "Unknown"
+            for p in meeting.find_all('div', class_='percfedRateItem'):
+                spans = p.find_all('span')
+                if len(spans) >= 2:
+                    data.append({
+                        'Meeting Date': pd.to_datetime(meeting_date),
+                        'Rate': spans[0].text.strip(),
+                        'Probability': spans[-1].text.strip().replace('%', ''),
+                        'Central Bank': 'FED',
+                        'Source': url
+                    })
+        return pd.DataFrame(data)
+    except Exception as e:
+        print(f"Error fetching FED probabilities: {e}")
+        return pd.DataFrame()
 
+def fetch_ecb_probabilities(url="https://ecb-watch.eu/probabilities"):
+    """Fetch implied rate change probabilities for ECB meetings."""
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        df = pd.DataFrame(data['abs_data'])
+        records = []
+        for meeting_date, row in df.T.iterrows():
+            for rate, prob in row.items():
+                for offset in [0, 1]:
+                    records.append({
+                        'Meeting Date': pd.to_datetime(meeting_date) + pd.DateOffset(days=offset),
+                        'Rate': rate,
+                        'Probability': prob,
+                        'Central Bank': 'ECB',
+                        'Source': url
+                    })
+        return pd.DataFrame(records)
+    except Exception as e:
+        print(f"Error fetching ECB probabilities: {e}")
+        return pd.DataFrame()
+
+# --- Streamlit Dashboard ---
 
 st.set_page_config(layout="wide", page_title="STIRT — Interest Rate Dashboard")
-
 st.title("STIRT Dashboard")
-underlyings = [
-    ('FED_FUNDS','1M'),
-    ('ESTR','1M'),
-    ('TONA','3M'), 
-    ('SONIA','1M'), 
-    ('SARON','3M'), 
-    ('CORRA','1M'),
-    ('SFE_BA','1M'),
-]
+
+# Cache meeting dates
+@st.cache_data(ttl=3600 * 12)
+def get_all_meeting_dates():
+    """Cache all central bank meeting dates."""
+    return {
+        "FED": get_upcoming_fomc_dates().tolist(),
+        "ECB": get_upcoming_ecb_monetary_dates().tolist(),
+        "BOE": get_upcoming_mpc_dates().tolist(),
+        "BOC": get_upcoming_boc_dates().tolist(),
+        "SNB": get_upcoming_snb_dates().tolist(),
+        "RBA": get_rba_board_meeting_dates().tolist(),
+        "BOJ": get_boj_meeting_dates().tolist()
+    }
+
+# Initialize session state
+if "db" not in st.session_state:
+    underlyings = [
+        ('FED_FUNDS', '1M'), ('ESTR', '1M'), ('TONA', '3M'), ('SONIA', '1M'),
+        ('SARON', '3M'), ('CORRA', '1M'), ('SFE_BA', '1M')
+    ]
+    start_date = datetime.now()
+    st.session_state.db = get_database(underlyings, start_date.month, start_date.year, n_contracts=6, max_workers=MAX_WORKERS)
+if "meeting_dates" not in st.session_state:
+    st.session_state.meeting_dates = get_all_meeting_dates()
+
+db = st.session_state.db
+meeting_dates = st.session_state.meeting_dates
 df_rates = get_central_bank_rates()
 
-underlying_map = {
-    "FED_FUNDS": "USA",
-    "ESTR": "Eurozone",
-    "CORRA": "Canada",
-    "SFE_BA": "Australia",
-    "SONIA": "United Kingdom", 
-    "SARON": "Switzerland",
-    "TONA": "Japan"
-}
-
-# ---------- Load data ----------
-@st.cache_data(ttl=3600*12)  # cache for 6 hours
-def load_db_from_barchart(underlyings, start_month, start_year, n_contracts, max_workers):
-    # uses your get_database
-    return get_database(tuple(underlyings), start_month, start_year, n_contracts, max_workers=max_workers)
-
-# Sidebar controls
+# Sidebar
 with st.sidebar:
-    n_contracts = 6
-    start_date= datetime.now()
-    start_month = start_date.month
-    start_year = start_date.year
-    # Load DB once, store in session state
-    if "db" not in st.session_state:
-        st.session_state.db = load_db_from_barchart(underlyings, start_month, start_year, n_contracts , MAX_WORKERS)
-    db = st.session_state.db
-    db = db.sort_values(by = ['year', 'month'], ascending=True)
-    underlying_rate = st.selectbox("Choose Underlying Rate", db['underlying'].unique()) 
+    underlying_rate = st.selectbox("Choose Underlying Rate", db['underlying'].unique())
+    price_or_rate = st.selectbox("Plot Price or Yield", ["Price", "Yield"], index=1)
+    mat_tenor = st.selectbox("1M/3M", db[db['underlying'] == underlying_rate]['tenor'].unique())
     with st.expander("Data Sources", expanded=False):
         st.markdown("""
         - [Barchart](https://www.barchart.com/futures/quotes/ZQ*0/futures-prices)
@@ -718,23 +572,14 @@ with st.sidebar:
         - [BOJ Meeting Calendar](https://www.mnimarkets.com/calendars/bank-of-japan-meeting-calendar)
         """)
 
-policy_rate_map = {
-    "FED_FUNDS": "Fed Funds",
-    "ESTR": "ECB Deposit Rate",
-    "SONIA": "Bank of England Base Rate",
-    "CORRA": "Bank of Canada Overnight Rate",
-    "SARON": "Swiss National Bank Policy Rate",
-    "SFE_BA": "Reserve Bank of Australia Cash Rate", 
-    "TONA": "Bank of Japan Policy Rate"
-}
+# Main Dashboard with Tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Time Series", "Contract Values", "Difference Matrix", "Meetings & Probabilities"])
 
-# ---------- Dashboard Main ----------
-# Display current policy rate for selected underlying
-with st.container():
+with tab1:
     st.markdown("""
     <style>
     div[data-testid="stMetric"] {
-        background-color: blue;
+        background-color: #1e3a8a;
         padding: 10px;
         border-radius: 5px;
         box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.1);
@@ -742,249 +587,79 @@ with st.container():
         font-family: 'Arial', sans-serif;
         margin-bottom: 20px;
     }
-    div[data-testid="stMetric"] label[data-testid="stMetricLabel"] {
-        color: white !important;
-        font-weight: bold;
-    }
-    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
-        color: white !important;
-    }
+    div[data-testid="stMetric"] label[data-testid="stMetricLabel"],
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"],
     div[data-testid="stMetric"] div[data-testid="stMetricDelta"] {
         color: white !important;
+        font-weight: bold;
     }
     </style>
     """, unsafe_allow_html=True)
 
-    country = underlying_map.get(underlying_rate)
+    country = UNDERLYING_MAP.get(underlying_rate, "")
     if country and country in df_rates.index:
         policy_info = df_rates.loc[country]
-        if country == "Eurozone":
-            country = "EU"
-        elif country == "USA":
-            country = "US"
-        st.subheader(f"Current Policy Rate: {policy_rate_map.get(underlying_rate, underlying_rate)}")
-
+        country_display = "EU" if country == "Eurozone" else "US" if country == "USA" else country
+        st.subheader(f"Current Policy Rate: {POLICY_RATE_MAP.get(underlying_rate, underlying_rate)}")
         col1, col2, col3 = st.columns(3, gap="small")
-        col1.metric(label="Country", value=country)
+        col1.metric(label="Country", value=country_display)
         col2.metric(label="Rate (%)", value=policy_info['Rate'])
-        col3.metric(label="Last Change", value=policy_info['Change'], delta=None)
-
+        col3.metric(label="Last Change", value=policy_info['Change'])
         st.caption(f"Last Change Date: {policy_info['Date'][:-4] + ' ' + policy_info['Date'][-4:]}")
 
-price_or_rate = st.selectbox("Plot Price or Yield", ["Price", "Yield"], index=1) 
-series_choice = "implied_rate" if price_or_rate == "Yield" else "lastPrice"
-to_plot = []
-contract_df = db[db['underlying'] == underlying_rate]
-for i in contract_df['contract_name'].unique():
-    series = contract_df[contract_df['contract_name'] == i][series_choice]
-    series.name = i
-    to_plot.append(series)
-to_plot_df = pd.concat(to_plot, axis=1)
-plot_df(to_plot_df)
+with tab2:
+    series_choice = "implied_rate" if price_or_rate == "Yield" else "lastPrice"
+    contract_df = db[db['underlying'] == underlying_rate]
+    to_plot = [contract_df[contract_df['contract_name'] == i][series_choice].rename(i) for i in contract_df['contract_name'].unique()]
+    if to_plot:
+        to_plot_df = pd.concat(to_plot, axis=1)
+        plot_df(to_plot_df, title=f"{underlying_rate} ({price_or_rate})", ylabel=price_or_rate, xlabel="Date")
 
+with tab3:
+    st.subheader(f"Latest Contract Values as of {datetime.now().strftime('%Y-%m-%d')}")
+    n_contracts_adj = 12 if mat_tenor == '3M' else 6
+    latest_df = get_latest(db, underlying_rate, mat_tenor, (datetime.now().month, datetime.now().year), n_contracts_adj, price_or_rate.lower())
+    if not latest_df.empty:
+        st.dataframe(latest_df, use_container_width=True, hide_index=True)
 
-mat_tenor = st.selectbox("1M/3M", db[db['underlying'] == underlying_rate]['tenor'].unique())
-st.subheader("Latest contract values as of " + datetime.now().strftime("%Y-%m-%d"))
-n_contracts_adj = n_contracts if mat_tenor != '3M' else 12
-get_latest(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
+with tab4:
+    st.subheader("Difference Matrix")
+    adj_start_month = datetime.now().month + (3 - datetime.now().month % 3) if mat_tenor == '3M' and datetime.now().month % 3 != 1 else datetime.now().month
+    diff_df = get_matrix(db, underlying_rate, mat_tenor, (adj_start_month, datetime.now().year), n_contracts_adj, price_or_rate.lower())
+    if not diff_df.empty:
+        def color_pos_neg(val):
+            if pd.isna(val):
+                return ''
+            color = 'green' if val > 0 else 'red' if val < 0 else ''
+            return f'color: {color}'
+        styled_df = diff_df.replace(0, np.nan).style.applymap(color_pos_neg).format("{:.2f}")
+        st.dataframe(styled_df, use_container_width=True)
 
+with tab5:
+    st.subheader("Upcoming Meetings")
+    meetings = meeting_dates.get(CB_MAP.get(underlying_rate, ""), [])
+    if meetings:
+        st.dataframe(pd.DataFrame(meetings.head(5), columns=["Meeting Date"]), use_container_width=True, hide_index=True)
 
-st.subheader("Difference matrix")
-if mat_tenor == '3M':
-    start_month += (3 - start_month % 3) if start_month % 3 != 1 else 0
-    n_contracts_adj = 12
-else:
-    n_contracts_adj = n_contracts
-diff_df = get_matrix(db, underlying_rate, mat_tenor, (start_month, start_year), n_contracts_adj, price_or_rate=price_or_rate)
-# Function to color values
-def color_pos_neg(val):
-    if val == None:
-        return ''
-    color = ''
-    if val > 0: 
-        color = 'green'
-    elif val < 0: 
-        color = 'red'
-    return f'color: {color}'
-styled_df = diff_df.replace(0, np.nan).style.applymap(color_pos_neg).format("{:.2f}")
-st.dataframe(styled_df, use_container_width=True)
+    if underlying_rate in CB_MAP and CB_MAP[underlying_rate] in ["FED", "ECB"]:
+        combined_df = pd.concat([fetch_fed_probabilities(), fetch_ecb_probabilities()], ignore_index=True)
+        combined_df['Probability'] = combined_df['Probability'].astype(float) / 100.0
+        combined_df['MeetingStr'] = combined_df['Meeting Date'].dt.strftime('%Y-%m-%d')
+        combined_df['Underlying'] = combined_df['Central Bank'].map({v: k for k, v in CB_MAP.items()})
 
-
-cb_map = {
-    "FED_FUNDS": "FED",
-    "ESTR": "ECB",
-    "SONIA": "BOE",
-    "CORRA": "BOC",
-    "SARON": "SNB",
-    "SFE_BA": "RBA", 
-    "TONA": "BOJ"
-}
-
-
-@st.cache_data(ttl=3600*12)  # cache for 12 hours
-def get_all_meeting_dates():
-    return {
-        "FED": get_upcoming_fomc_dates().tolist(),
-        "ECB": get_upcoming_ecb_monetary_dates().tolist(),
-        "BOE": get_upcoming_mpc_dates().tolist(),
-        "BOC": get_upcoming_boc_dates().tolist(),
-        "SNB": get_upcoming_snb_dates().tolist(),
-        "RBA": get_rba_board_meeting_dates().tolist(), 
-        "BOJ": get_boj_meeting_dates().tolist()
-    }
-if "meeting_dates" not in st.session_state:
-    st.session_state.meeting_dates = get_all_meeting_dates()
-
-meeting_dates = st.session_state.meeting_dates
-spot_df = pd.DataFrame({
-    "underlying": ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA", "TONA"],
-    "spot_rate": [float(df_rates.loc[underlying_map[u], 'Rate'].split("-")[-1]) if underlying_map[u] in df_rates.index else np.nan for u in ["FED_FUNDS", "ESTR", "SONIA", "CORRA", "SARON", "SFE_BA", "TONA"]]
-})
-
-def implied_cut_probability_refined(current_rate, futures_rate, cut_size=0.25, days_after_meeting=10, total_days=30):
-    """
-    Refined implied probability of a rate cut using Fed Funds futures.
-    """
-    if days_after_meeting <= 0:
-        # No post-meeting days in this contract, no information about cut probability
-        return 0.0
-    
-    weight = days_after_meeting / total_days
-    prob = (current_rate - futures_rate) / (cut_size * weight)
-    return max(0, min(1, prob))
-
-def get_most_recent_data(db, underlying): 
-    db = db.copy()
-    db = db.sort_index()
-    return db[db['underlying'] == underlying].groupby('contract_name').last()
-
-def implied_cut_probability(earlier_price, later_price, step_bp=0.25): 
-    prob = max(0, min(1, (earlier_price - later_price) / step_bp)) 
-    raw = max(0, (earlier_price - later_price) / step_bp)
-    return prob, raw
-
-#show upcoming meetings
-st.subheader("Upcoming Meetings")
-st.dataframe(pd.DataFrame(meeting_dates.get(cb_map.get(underlying_rate, ""), []), columns=["Meeting Date"]), use_container_width=True, hide_index=True)
-
-# --- FED DATA ---
-FED_URL = 'https://www.investing.com/central-banks/fed-rate-monitor'
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-}
-
-def fetch_fed_probabilities(url=FED_URL):
-    r = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(r.text, 'html.parser')
-    meetings = soup.find_all('div', class_='cardWrapper')
-    data = []
-
-    for meeting in meetings:
-        date_div = meeting.find('div', class_='fedRateDate')
-        meeting_date = date_div.text.strip() if date_div else "Unknown"
-
-        percs = meeting.find_all('div', class_='percfedRateItem')
-        for p in percs:
-            spans = p.find_all('span')
-            if len(spans) >= 2:
-                target_rate = spans[0].text.strip()
-                probability = spans[-1].text.strip()
-                data.append({
-                    'Meeting Date':  pd.to_datetime(meeting_date), 
-                    'Rate': target_rate,
-                    'Probability': probability,
-                    'Central Bank': 'FED', 
-                    "Source": "https://www.investing.com/central-banks/fed-rate-monitor"
-                })
-
-    return pd.DataFrame(data)
-
-# --- ECB DATA ---
-ECB_PROB_URL = 'https://ecb-watch.eu/probabilities'
-
-def fetch_ecb_probabilities(url=ECB_PROB_URL):
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-    df = pd.DataFrame(data['abs_data'])
-    records = []
-
-    for meeting_date, row in df.T.iterrows():
-        for rate, prob in row.items():
-            records.append({
-                'Meeting Date':  pd.to_datetime(meeting_date),
-                'Rate': rate,
-                'Probability': prob,
-                'Central Bank': 'ECB',
-                "Source": "https://ecb-watch.eu/"
-            })
-            records.append({
-                'Meeting Date':  pd.to_datetime(meeting_date) + pd.DateOffset(days=1),
-                'Rate': rate,
-                'Probability': prob,
-                'Central Bank': 'ECB', 
-                "Source": "https://ecb-watch.eu/"
-            })
-    return pd.DataFrame(records)
-
-# --- COMBINE ---
-fed_df = fetch_fed_probabilities()
-ecb_df = fetch_ecb_probabilities()
-
-combined_df = pd.concat([fed_df, ecb_df], ignore_index=True)
-
-combined_df['Probability'] = combined_df['Probability'].astype(str).str.replace('%','').astype(float)
-
-combined_df = combined_df.sort_values(['Central Bank', 'Meeting Date', 'Rate']).reset_index(drop=True)
-
-chart_df = combined_df.rename(columns={
-    'Meeting Date': 'Meeting',
-    'Rate': 'Change',               # rate change in bps
-    'Probability': 'Implied Probability',
-    'Central Bank': 'Central Bank',
-})
-
-# Assume 'Underlying' is same as 'Central Bank'
-CB_map = { 
-    "FED_FUNDS": "FED",
-    "ESTR": "ECB",
-}
-chart_df['Underlying'] = chart_df['Central Bank'].map({v: k for k, v in CB_map.items()})
-# Format meeting string for selection
-chart_df['MeetingStr'] = chart_df['Meeting'].dt.strftime('%Y-%m-%d')
-
-if underlying_rate in CB_map.keys():
-    # Streamlit selectbox
-    underlying_rate = underlying_rate if underlying_rate in CB_map.keys() else "FED_FUNDS"
-    meeting = st.selectbox("Select Meeting Date", meeting_dates.get(cb_map.get(underlying_rate, "FED"), []))
-
-    # Filter for selected bank and meeting
-    filtered_df = chart_df[
-        (chart_df['Central Bank'] == cb_map.get(underlying_rate, "FED")) & 
-        (chart_df['MeetingStr'] == meeting)
-    ]
-    print(f"Filtered DataFrame:\n{filtered_df}")
-
-    # Ensure probability is numeric (0-1)
-    if filtered_df['Implied Probability'].max() > 1:
-        filtered_df['Implied Probability'] /= 100.0
-
-    # Plot bar chart
-    chart = (
-        alt.Chart(filtered_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("Change:N", title="Rate Change (%)"),
-            y=alt.Y("Implied Probability:Q", title="Implied Probability", axis=alt.Axis(format='%')),
-            color="Change:N",
-            tooltip=[
-                "Central Bank",
-                "Underlying",
-                "MeetingStr",
-                alt.Tooltip("Implied Probability", format=".0%")
-            ]
-        )
-        .properties(width=300, height=400)
-    )
-
-    st.altair_chart(chart, use_container_width=True)
+        st.subheader("Implied Rate Change Probabilities")
+        meeting = st.selectbox("Select Meeting Date", meetings)
+        filtered_df = combined_df[(combined_df['Central Bank'] == CB_MAP.get(underlying_rate)) & (combined_df['MeetingStr'] == meeting)]
+        if not filtered_df.empty:
+            chart = (
+                alt.Chart(filtered_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Rate:N", title="Rate Change (%)"),
+                    y=alt.Y("Probability:Q", title="Implied Probability", axis=alt.Axis(format='%')),
+                    color="Rate:N",
+                    tooltip=["Central Bank", "Underlying", "MeetingStr", alt.Tooltip("Probability", format=".0%")]
+                )
+                .properties(width=300, height=400)
+            )
+            st.altair_chart(chart, use_container_width=True)
