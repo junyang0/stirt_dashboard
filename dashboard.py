@@ -639,7 +639,7 @@ with tab5:
     st.subheader("Upcoming Meetings")
     meetings = meeting_dates.get(CB_MAP.get(underlying_rate, ""), [])
     if meetings:
-        st.dataframe(pd.DataFrame(meetings.head(5), columns=["Meeting Date"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(meetings, columns=["Meeting Date"]).head(5), use_container_width=True, hide_index=True)
 
     if underlying_rate in CB_MAP and CB_MAP[underlying_rate] in ["FED", "ECB"]:
         combined_df = pd.concat([fetch_fed_probabilities(), fetch_ecb_probabilities()], ignore_index=True)
